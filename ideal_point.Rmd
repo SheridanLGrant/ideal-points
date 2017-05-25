@@ -1,4 +1,4 @@
----
+mod---
 title: "Estimating Ideal Points"
 ---
 
@@ -36,9 +36,11 @@ there are three types of invariance:
 
 # Example US: Congressional Voting
 
-```{r}
-library("tidyverse")
+```{r message=FALSE}
 library("pscl")
+library("tidyverse")
+library("forcats")
+library("stringr")
 library("rstan")
 ```
 
@@ -67,26 +69,181 @@ roll-calls.
 9    Not Voting
 ---- ----------------------------------------------------------
 
-To simplify the analysis, the outcomes will be aggregated to "Yes", "No", and missing values (which will be dropped):
+To simplify the analysis, the outcomes will be aggregated to "Yes", "No", and missing values (which 
 ```{r}
-votes <- s109$votes %>%
+s109_vote_data <- as.data.frame(s109$vote.data) %>%
+  mutate(rollcall = paste(session, number, sep = "-"),
+         passed = result %in% c("Confirmed", "Agreed To", "Passed"),
+         pct_yea = yeatotal / (yeatotal + naytotal),
+         unanimous = pct_yea %in% c(0, 1),
+         lopsided = pct_yea < 0.35 | pct_yea > 0.65) %>%
+  filter(!unanimous) %>%
+  mutate(.rollcall_id = row_number())
+
+s109_legis_data <- as.data.frame(s109$legis.data) %>%
+  rownames_to_column("legislator") %>%
+  mutate(.legis_id = row_number())
+
+s109_votes <- s109$votes %>%
   as.data.frame() %>%
   rownames_to_column("legislator") %>%
   gather(rollcall, vote, -legislator) %>%
-  mutate(y = NA,
-         y = if_else(vote %in% c(1, 2, 3), TRUE, y),
-         y = if_else(vote %in% c(4, 5, 6), FALSE, y),
-         legislator = factor(legislator),
-         rollcall = factor(rollcall, levels = colnames(s109$votes))) %>%
-  filter(!is.na(y))
+  # recode to Yea (TRUE), Nay (FALSE), or missing
+  mutate(yea = NA,
+         yea = if_else(vote %in% c(1, 2, 3), TRUE, yea),
+         yea = if_else(vote %in% c(4, 5, 6), FALSE, yea)) %>%
+  filter(!is.na(yea)) %>%
+  inner_join(dplyr::select(s109_vote_data, rollcall, .rollcall_id), by = "rollcall") %>%
+  inner_join(dplyr::select(s109_legis_data, legislator, party, .legis_id), by = "legislator")
+
+```
+
+Identify votes. Restrict all party line votes to have positive betas:
+```{r}
+lambda <-
+  s109_votes %>%
+  group_by(.rollcall_id, party) %>%
+  summarise(yea = mean(yea)) %>%
+  spread(party, yea) %>%
+  ungroup() %>%
+  mutate(partyline = "",
+         partyline = if_else(R < 0.1 & D > 0.9, "D", partyline),
+         partyline = if_else(R > 0.9 & D < 0.1, "R", partyline),
+         alpha = if_else(partyline %in% "R", 20,
+                          if_else(partyline %in% "D", -20, 0)),
+         init = if_else(partyline %in% "R", 1,
+                        if_else(partyline %in% "D", -1, 0)))
+
 ```
 
 ```{r}
-mod_ideal_point <- stan_model("stan/ideal_point.stan")
+
+
+```{r message=FALSE}
+mod_ideal_point <- stan_model("ideal_point-4.stan")
 ```
 ```{r results='asis'}
 mod_ideal_point
 ```
+
+## No Identification
+
+```{r}
+theta <-
+  s109_legis_data %>%
+  mutate(init = if_else(party == "R", 1,
+                        if_else(party == "D", -1, 0)))
+```
+
+```{r}
+data_ideal_point <-
+  within(list(), {
+    y <- as.integer(s109_votes$yea)
+    y_idx_leg <- as.integer(s109_votes$.legis_id)
+    y_idx_vote <- as.integer(s109_votes$.rollcall_id)
+    Y_obs <- length(y)
+    N <- max(s109_votes$.legis_id)
+    K <- max(s109_votes$.rollcall_id)
+    # priors
+    alpha_loc <- 0
+    alpha_scale <- 5.0
+    lambda_loc <- rep(0, K)
+    lambda_scale <- rep(2.5, K)
+    lambda_alpha <- lambda$alpha
+  })
+```
+The prior scale for all the non-fixed $\theta_k$ is weakly informative since the scale is fixed by the two ideal points. However, this may still help regularize some extreme legsilators.
+Likewise, a stronger prior on $\alpha$ can help regularize the cutpoints of lopsided votes.
+
+```{r}
+init <- list(list( 
+  lambda = lambda$init,
+  theta = theta$init
+))
+```
+
+```{r results = 'hide'}
+mod_sampling <- sampling(mod_ideal_point,
+                         data = data_ideal_point,
+                         init = init,
+                         chains = 1,
+                         iter = 500)
+```
+
+Extract the ideal point data:
+```{r}
+ideal_points <- 
+  bind_cols(s109_legis_data,
+           as_tibble(summary(mod_sampling, par = "theta")$summary)) %>%
+  mutate(legislator = fct_reorder(legislator, mean))
+```
+
+```{r}
+ggplot(ideal_points, aes(x = legislator, y = mean,
+                         ymin = `2.5%`, ymax = `97.5%`, colour = party)) +
+  geom_pointrange() +
+  coord_flip() + 
+  scale_color_manual(values = c(D = "blue", Indep = "green", R = "red"))
+```
+
+## Understanding Invariance
+
+Scale invariance:
+$$
+\begin{aligned}[t]
+\mu_{i,j} &= \alpha_j + \lambda_j \theta_i \\
+         &= \alpha_j + \left(\frac{\lambda_j}{c}\right) \left(\theta_i c \right) \\
+         &= \alpha_j + \lambda^*_j \theta^*_i
+\end{aligned}
+$$
+
+Addition invariance:
+$$
+\begin{aligned}[t]
+\mu_{i,j} &= \alpha_j + \lambda_j \theta_i \\
+          &= \alpha_j - \lambda_j c + \lambda_j c + \lambda_j \theta_i \\
+         &= (\alpha_j - \lambda_j c) + \lambda_j (\theta_i + c) \\
+         &= \alpha_j^* + \lambda_j \theta^*_i
+\end{aligned}
+$$
+
+Rotation invariance:
+$$
+\begin{aligned}[t]
+\mu_{i,j} &= \alpha_j + \lambda_j \theta_i \\
+          &= \alpha_j  + \lambda_j (-1) (-1) \theta_i \\
+          &= \alpha_j  + (-\lambda_j) (-\theta_i) \\          
+          &= \alpha_j + \lambda_j^* \theta^*_i
+\end{aligned}
+$$
+
+Example:
+```{r}
+theta <- c(-1, -0.5, 0.5, 1)
+alpha <- c(1, 0, -1)
+lambda <- c(-0.5, 0, 0.5)
+y <- matrix(c(1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 1), 3, 4)
+k <- 1
+
+list(sum(plogis(y - (alpha + lambda %o% theta))),
+     sum(plogis(y - (alpha + -lambda %o% -theta))),
+     sum(plogis(y - ((alpha - lambda * k) + lambda %o% (theta + k)))),
+     sum(plogis(y - ((alpha + (lambda / k) %o% (theta * k))))))
+```
+
+Questions: For each of these: Which types of rotation does it solve?
+
+1. Fix one element of $\lambda$. 
+2. Fix one element of $\theta$.
+3. Fix one element of $\alpha$.
+4. Fix two elements of $\alpha$.
+5. Fix two elements of $\theta$.
+6. Fix two elements of $\lambda$.
+
+
+
+
+## Identification by Fixing Legislator's Ideal Points
 
 Identification of latent state models can be challenging.
 Since we \textit{a priori} know, or expect, that the primary ideological dimension is Liberal-Conservative.
@@ -105,37 +262,91 @@ $$
 \end{aligned}
 $$
 
-
-```{r}
-theta <- data_frame(
-  legislator = levels(votes$legislator),
-  value = NA_real_
-  ) %>%
-  mutate(
-    value = if_else(legislator == "FRIST (R TN)", -1, value),
-    value = if_else(legislator == "REID (D NV)", 1, value)    
-  )
+```{r message=FALSE}
+mod_ideal_point_1 <- stan_model("ideal_point-2.stan")
+```
+```{r results='asis'}
+mod_ideal_point_1
 ```
 
 ```{r}
-data_ideal_point <-
+theta <-
+  s109_legis_data %>%
+  mutate(init = if_else(party == "R", 1,
+                        if_else(party == "D", -1, 0)),
+         # set values
+         theta = if_else(legislator == "FRIST (R TN)", 1,
+                         if_else(legislator == "REID (D NV)", -1, NA_real_)))
+                         
+```
+
+```{r}
+data_ideal_point_1 <-
   within(list(), {
-    y <- as.integer(votes$y)
-    y_idx_leg <- as.integer(votes$legislator)
-    y_idx_vote <- as.integer(votes$rollcall)
+    y <- as.integer(s109_votes$yea)
+    y_idx_leg <- as.integer(s109_votes$.legis_id)
+    y_idx_vote <- as.integer(s109_votes$.rollcall_id)
     Y_obs <- length(y)
-    N <- nlevels(votes$legislator)
-    K <- nlevels(votes$rollcall)
-    # values of known ideal points
-    theta_obs_idx <- which(!is.na(theta$value))
-    N_obs <- length(theta_obs_idx)
-    theta_param_idx <- which(is.na(theta$value))
-    N_param <- length(theta_param_idx)
-    theta_obs <- theta$value[theta_obs_idx]
+    N <- max(s109_votes$.legis_id)
+    K <- max(s109_votes$.rollcall_id)
+    # priors
+    alpha_loc <- rep(0, K)
+    alpha_scale <- rep(5, K)
+    lambda_loc <- rep(0, K)
+    lambda_scale <- rep(2.5, K)
+    lambda_skew <- rep(0, K)
+    N_obs <- sum(!is.na(theta$theta))
+    theta_obs_idx <- which(!is.na(theta$theta))
+    theta_obs <- theta$theta[!is.na(theta$theta)]
+    N_param <- sum(is.na(theta$theta))
+    theta_param_idx <- which(is.na(theta$theta))
+    theta_loc <- rep(0, N_param)
+    theta_scale <- rep(5, N_param)
   })
 ```
 
 ```{r}
-sampling(mod_ideal_point, data = data_ideal_point)
+init_1 <- list(
+  list(theta_param = theta$init[is.na(theta$theta)])
+)
 ```
 
+```{r results = 'hide'}
+fit_ideal_1 <- sampling(mod_ideal_point_1,
+                        data = data_ideal_point_1,
+                        init = init_1,
+                        chains = 1,
+                        iter = 500)
+```
+
+```{r}
+ideal_points <- 
+  bind_cols(s109_legis_data,
+           as_tibble(summary(fit_ideal_1, par = "theta")$summary)) %>%
+  mutate(legislator = fct_reorder(legislator, mean))
+```
+
+```{r}
+ggplot(ideal_points, aes(x = legislator, y = mean,
+                         ymin = `2.5%`, ymax = `97.5%`, colour = party)) +
+  geom_pointrange() +
+  coord_flip() + 
+  scale_color_manual(values = c(D = "blue", Indep = "green", R = "red"))
+```
+
+
+Questions
+
+1. Analyze this with ShinyStan
+2. Are there any problems with Rhat or n_eff?
+3. Why is Bush's ideal point so uncertain?
+4. Why are the ideal points at either end more uncertain?
+5. What is the reason for the skew normal distributions? 
+7. See Jackman and replicate:
+
+    8. Which Senator is the most liberal, and what is the probability that they are the most liberal?
+    9. Which Senator is the median (50%), median of the majority party?
+    10. Which bill discriminates the least? 
+    
+
+    

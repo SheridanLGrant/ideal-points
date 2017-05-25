@@ -1,47 +1,42 @@
 // ideal point model without identification except priors
 data {
-  // number of items
-  int N;
   // number of individuals
+  int N;
+  // number of items
   int K;
   // observed votes
   int<lower = 0, upper = N * K> Y_obs;
-  int y_idx_row[Y_obs];
-  int y_idx_col[Y_obs];
+  int y_idx_leg[Y_obs];
+  int y_idx_vote[Y_obs];
   int y[Y_obs];
   // priors
-  vector[K] alpha_loc;
-  vector<lower = 0.>[K] alpha_scale;
+  real alpha_loc;
+  real<lower = 0.> alpha_scale;
   vector[K] lambda_loc;
   vector<lower = 0.>[K] lambda_scale;
-  vector[K] lambda_skew;
-  vector[N] theta_loc;
-  vector<lower = 0.>[N] theta_scale;
+  vector[K] lambda_alpha;
 }
 parameters {
   // item difficulties
-  vector[N] alpha;
+  vector[K] alpha;
   // item discrimination
-  vector[N] lambda;
+  vector[K] lambda;
   // unknown ideal points
-  vector[K] theta;
+  vector[N] theta_raw;
 }
 transformed parameters {
   // create theta from observed and parameter ideal points
   vector[Y_obs] mu;
+  vector[N] theta;
+  theta = (theta_raw - mean(theta_raw)) ./ sd(theta_raw);
   for (i in 1:Y_obs) {
-    int tmpN;
-    int tmpK;
-    tmpN = y_idx_row[i];
-    tmpK = y_idx_col[i];
-    mu[i] = alpha[tmpN] + lambda[tmpN] * theta[tmpK];
+    mu[i] = alpha[y_idx_vote[i]] + lambda[y_idx_vote[i]] * theta[y_idx_leg[i]];
   }
 }
 model {
   alpha ~ normal(alpha_loc, alpha_scale);
-  lambda ~ skew_normal(lambda_loc, lambda_scale, lambda_skew);
-  // only identification is via this
-  theta ~ normal(theta_loc, theta_scale);
+  lambda ~ skew_normal(lambda_loc, lambda_scale, lambda_alpha);
+  theta_raw ~ normal(0., 1.);
   y ~ binomial_logit(1, mu);
 }
 generated quantities {

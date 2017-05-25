@@ -1,3 +1,4 @@
+// ideal point model identified with fixed legislator ideal points
 data {
   // number of items
   int K;
@@ -15,14 +16,11 @@ data {
   int<lower = 1, upper = N> theta_obs_idx[N_obs];
   int theta_obs[N_obs];
   int<lower = 1, upper = N> theta_param_idx[N_param];
-  vector[N_param] theta_loc;
-  vector<lower = 0.>[N_param] theta_scale;
   // priors
   vector[K] alpha_loc;
   vector<lower = 0.>[K] alpha_scale;
   vector[K] lambda_loc;
   vector<lower = 0.>[K] lambda_scale;
-  vector[K] lambda_skew;
 }
 parameters {
   // item difficulties
@@ -31,6 +29,9 @@ parameters {
   vector[K] lambda;
   // unknown ideal points
   vector[N_param] theta_param;
+  // prior on ideal points
+  real xi;
+  real<lower = 0.> tau;
 }
 transformed parameters {
   // create theta from observed and parameter ideal points
@@ -48,8 +49,10 @@ transformed parameters {
 }
 model {
   alpha ~ normal(alpha_loc, alpha_scale);
-  lambda ~ skew_normal(lambda_loc, lambda_scale, lambda_skew);
-  theta_param ~ normal(theta_loc, theta_scale);
+  lambda ~ normal(lambda_loc, lambda_scale);
+  theta_param ~ normal(xi, tau);
+  xi ~ normal(0., 1.);
+  tau ~ normal(0., 1.);
   y ~ binomial_logit(1, mu);
 }
 generated quantities {
